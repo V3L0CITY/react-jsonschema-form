@@ -18,11 +18,10 @@ import {
   setByPath,
   ADDITIONAL_PROPERTIES_KEY,
   ADDITIONAL_PROPERTY_FLAG,
-  ANY_OF_KEY,
-  forbidsAdditionalProperties,
+  getAdditionalPropertySchema,
+  getAdditionalPropertyType,
   getFreePropertyNames,
-  getPatternPropertySchema,
-  getSchemaType,
+  getMatchingPatternProperties,
   getTemplates,
   getPropertySchema,
   getUiOptions,
@@ -31,8 +30,6 @@ import {
   shouldRenderOptionalField,
   toFieldPath,
   fieldPathToId,
-  ONE_OF_KEY,
-  REF_KEY,
   isObject,
   TranslatableString,
   uiBooleanOption,
@@ -91,14 +88,18 @@ function getAdditionalPropertyOrder<S extends StrictRJSFSchema = RJSFSchema>(
 }
 
 /** Picks the name a new additional property should prefer out of the `freeNames` the schema still allows. A name one
- * of the `patternProperties` patterns matches is described by that pattern, which is what the new property takes its
- * seed and its field from, while a name they don't match is left to `additionalProperties`: an
- * `additionalProperties: false` forbids it, an `unevaluatedProperties: false` forbids it where no
- * `additionalProperties` evaluates it, and an `additionalProperties` that is `true`, or absent and so read as `true`,
- * describes it no better than the data it comes to hold — and, where it is absent, `omitExtraData` prunes it, since
- * patterns describe no key they don't match. So a matching name is worth more to the user than the first one the
- * `enum` happens to list, unless an `additionalProperties` schema describes the unmatched name as fully as a pattern
- * would, leaving nothing to prefer.
+ * of the `patternProperties` patterns describes is one the new property takes its seed and its field from, while a name
+ * they don't match is left to `additionalProperties`: an `additionalProperties: false` forbids it, an
+ * `unevaluatedProperties: false` forbids it where no `additionalProperties` evaluates it, and an
+ * `additionalProperties` that is `true`, or absent and so read as `true`, describes it no better than the data it comes
+ * to hold — and, where it is absent, `omitExtraData` prunes it, since patterns describe no key they don't match. So a
+ * described name is worth more to the user than the first one the `enum` happens to list, unless an
+ * `additionalProperties` schema describes the unmatched name as fully as a pattern would, leaving nothing to prefer.
+ *
+ * A name matched only by patterns that forbid it is no better than an unmatched one, so a matching pattern is only
+ * preferred where `getAdditionalPropertySchema()` says the name is not forbidden. A name the schema forbids outright is
+ * worth less than one it merely leaves undescribed, which at least renders a field for the value it holds, so an
+ * allowed name is preferred over a forbidden one even when no pattern describes it.
  *
  * It stays a preference rather than a restriction: `propertyNames` enumerates the other names all the same, and a
  * property the user can still rename beats no new property at all.
@@ -111,7 +112,12 @@ function findPreferredPropertyName<S extends StrictRJSFSchema = RJSFSchema>(sche
   if (!schema.patternProperties || isObject(schema.additionalProperties)) {
     return undefined;
   }
-  return freeNames.find((freeName) => getPatternPropertySchema<S>(schema, freeName));
+  const isAllowed = (freeName: string) => getAdditionalPropertySchema<S>(schema, freeName) !== false;
+  return (
+    freeNames.find(
+      (freeName) => isAllowed(freeName) && Object.keys(getMatchingPatternProperties<S>(schema, freeName)).length > 0,
+    ) ?? freeNames.find(isAllowed)
+  );
 }
 
 /** Props for the `ObjectFieldProperty` component */
@@ -402,43 +408,33 @@ export default function ObjectField<
     }
     const preferredKey = freeNames ? (findPreferredPropertyName<S>(schema, freeNames) ?? freeNames[0]) : 'newKey';
     const newKey = getAvailableKey(preferredKey, newFormData);
-    // The new property is seeded from the very subschema it will render with, so the seed and the field can't
-    // disagree about the key: the `patternProperties` patterns it matches, when it matches any, and
-    // `additionalProperties` otherwise
-    const patternSchema = getPatternPropertySchema<S>(schema, newKey);
-    if (!patternSchema && forbidsAdditionalProperties<S>(schema)) {
-      // A schema that forbids a key the patterns don't match leaves `retrieveSchema()` nothing but the
-      // `{ type: 'null' }` stub to render it with, so any other seed would be a value no field can show
+    // The new property is seeded from the very schema the object says describes its name, which is the one
+    // `retrieveSchema()` stubs the field from, so the seed and the field can't disagree about the key
+    const keySchema = getAdditionalPropertySchema<S>(schema, newKey);
+    if (keySchema === false) {
+      // A schema that forbids the name leaves `retrieveSchema()` nothing but the `{ type: 'null' }` stub to render it
+      // with, so any other seed would be a value no field can show
       setByPath(newFormData, newKey, null);
     } else {
-      let type: ReturnType<typeof getSchemaType> = undefined;
+      let type: string | undefined = undefined;
       let constValue: RJSFSchema['const'] = undefined;
       let defaultValue: RJSFSchema['default'] = undefined;
-      // An `additionalProperties` that is `true`, or absent and so read as `true`, describes no schema to seed from,
-      // which leaves the generic default below to do it
-      let keySchema: S | undefined = undefined;
-      if (patternSchema) {
-        keySchema = schemaUtils.retrieveSchema(patternSchema);
-      } else if (isObject(schema.additionalProperties)) {
-        keySchema = schema.additionalProperties as S;
-      }
-      if (keySchema) {
-        constValue = keySchema.const;
-        defaultValue = keySchema.default;
-        if (REF_KEY in keySchema) {
-          keySchema = schemaUtils.retrieveSchema({ [REF_KEY]: keySchema[REF_KEY] } as S, formData);
-          constValue = keySchema.const;
-        }
-        type = getSchemaType(keySchema);
-        if (!type && (ANY_OF_KEY in keySchema || ONE_OF_KEY in keySchema)) {
-          type = 'object';
-        }
+      // A `true`, which is what an `additionalProperties` the schema leaves out reads as, describes no schema to seed
+      // from, which leaves the generic default below to do it
+      if (isObject(keySchema)) {
+        // Resolved the way `retrieveSchema()` resolves it before stubbing, so a `$ref` and an `allOf` of matching
+        // patterns are seeded from what they describe. The new property holds no data yet, so there is none to resolve
+        // the schema against
+        const resolvedKeySchema = schemaUtils.retrieveSchema(keySchema);
+        constValue = resolvedKeySchema.const;
+        defaultValue = resolvedKeySchema.default;
+        type = getAdditionalPropertyType<S>(resolvedKeySchema);
         // Route through the normal default pipeline (the same one an existing additionalProperties entry already
         // goes through) for every subschema shape — not just object/$ref — so nested schema defaults and
         // ui:initialValue/ui:emptyValue on uiSchema.additionalProperties apply the same way they do when Form first
         // mounts with that key already present in formData.
         defaultValue = schemaUtils.getDefaultFormState(
-          keySchema,
+          resolvedKeySchema,
           defaultValue as T,
           undefined,
           undefined,
